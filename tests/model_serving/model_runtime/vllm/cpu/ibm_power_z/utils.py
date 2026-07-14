@@ -1,4 +1,5 @@
 from typing import Any
+import time
 
 import requests
 import structlog
@@ -32,14 +33,24 @@ def send_chat_completions_request(
         max_tokens=max_tokens,
     )
     ca_bundle = get_ca_bundle(client=isvc.client)
+
+    start_time = time.time()
+
     response = requests.post(
         url=url,
         headers=RestHeader.HEADERS,
         json=payload,
         verify=ca_bundle or True,
-        timeout=30,
+        timeout=300,
     )
-    LOGGER.info("Chat completions response", status_code=response.status_code)
+
+    elapsed_seconds = round(time.time() - start_time, 2)
+
+    LOGGER.info(
+        "Chat completions response",
+        status_code=response.status_code,
+        elapsed_seconds=elapsed_seconds,
+    )
     response.raise_for_status()
     return response.json()
 
