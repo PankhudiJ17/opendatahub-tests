@@ -1,9 +1,13 @@
+import socket
+from typing import Any, Final
+
 import requests
 import structlog
 from kubernetes.dynamic import DynamicClient
 from ocp_resources.config_map import ConfigMap
 from ocp_resources.evalhub import EvalHub
 from ocp_resources.job import Job
+from ocp_resources.mlflow import MLflow
 from ocp_resources.role_binding import RoleBinding
 from ocp_resources.service_account import ServiceAccount
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
@@ -14,7 +18,9 @@ from tests.ai_safety.evalhub.constants import (
     EVALHUB_FULL_API_VERSION_V1ALPHA1,
     EVALHUB_HEALTH_PATH,
     EVALHUB_HEALTH_STATUS_HEALTHY,
+    EVALHUB_JOB_BENCHMARK_LOGS_PATH_TEMPLATE,
     EVALHUB_JOB_CONFIG_CLUSTERROLE,
+    EVALHUB_JOB_LOGS_PATH_TEMPLATE,
     EVALHUB_JOBS_PATH,
     EVALHUB_JOBS_WRITER_CLUSTERROLE,
     EVALHUB_K8S_LABEL_APP,
@@ -32,6 +38,65 @@ from utilities.guardrails import get_auth_headers
 from utilities.kueue_utils import Workload
 
 LOGGER = structlog.get_logger(name=__name__)
+
+
+class MLflowWithWorkspaces(MLflow):
+    """MLflow CR with workspaceLabelSelector support."""
+
+    def __init__(self, workspace_label_selector: dict[str, Any] | None = None, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._workspace_label_selector = workspace_label_selector
+
+    def to_dict(self) -> None:
+        super().to_dict()
+        if self._workspace_label_selector is not None and "spec" in self.res:
+            self.res["spec"]["workspaceLabelSelector"] = self._workspace_label_selector
+
+
+class TransientEvalhubHealthError(Exception):
+    """Recoverable failure while polling an EvalHub health endpoint."""
+
+
+_TRANSIENT_HEALTH_REQUEST_EXCEPTIONS: Final = (
+    requests.exceptions.ConnectTimeout,
+    requests.exceptions.ReadTimeout,
+)
+TRANSIENT_HEALTH_EXCEPTIONS: Final = {TransientEvalhubHealthError: []}
+
+
+def is_dns_resolution_error(err: BaseException) -> bool:
+    """Return True when the exception chain includes a DNS resolution failure."""
+    seen: set[int] = set()
+    exc: BaseException | None = err
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, socket.gaierror):
+            return True
+        if exc.__cause__ is not None:
+            exc = exc.__cause__
+        elif exc.__context__ is not None and not exc.__suppress_context__:
+            exc = exc.__context__
+        else:
+            exc = None
+    return False
+
+
+def probe_evalhub_health_endpoint(
+    url: str,
+    host: str,
+    ca_bundle_file: str,
+) -> requests.Response:
+    """GET the EvalHub health endpoint, retrying only on transient network failures."""
+    try:
+        return requests.get(url, verify=ca_bundle_file, timeout=10)
+    except requests.exceptions.ConnectionError as err:
+        if isinstance(err, requests.exceptions.SSLError) or is_dns_resolution_error(err):
+            raise
+        LOGGER.warning(f"Transient error checking EvalHub health at {host}: {err}")
+        raise TransientEvalhubHealthError(str(err)) from err
+    except _TRANSIENT_HEALTH_REQUEST_EXCEPTIONS as err:
+        LOGGER.warning(f"Transient error checking EvalHub health at {host}: {err}")
+        raise TransientEvalhubHealthError(str(err)) from err
 
 
 class EvalHubV1(EvalHub):
@@ -165,10 +230,16 @@ def validate_evalhub_request_denied(
     assert response.status_code in (400, 403), (
         f"Expected 400 or 403 for cross-tenant access, got {response.status_code}: {response.text}"
     )
-    data = response.json()
-    assert data.get("message_code") in ("unable_to_authorize_request", "forbidden"), (
-        f"Expected authorization denial, got message_code: {data.get('message_code')}"
-    )
+    try:
+        data = response.json()
+        assert data.get("message_code") in ("unable_to_authorize_request", "forbidden"), (
+            f"Expected authorization denial, got message_code: {data.get('message_code')}"
+        )
+    except ValueError:
+        # kube-rbac-proxy returns plain-text 403 with no JSON body
+        assert any(kw in response.text.lower() for kw in ("forbidden", "unauthorized", "auth")), (
+            f"Expected auth-related error in response body for cross-tenant GET, got: {response.text}"
+        )
 
 
 def validate_evalhub_request_no_tenant(
@@ -202,13 +273,14 @@ def validate_evalhub_request_no_tenant(
     )
     assert response.status_code == 400, f"Expected 400 Bad Request, got {response.status_code}: {response.text}"
     try:
-        body = response.json()
-    except ValueError:
-        body = {}
-    body_str = str(body).lower()
-    assert any(kw in body_str for kw in ("tenant", "missing tenant header", "x-tenant")), (
-        f"Expected tenant-header-related error in response body for no-tenant GET, got: {response.text}"
-    )
+        assert response.json().get("message_code") == "missing_tenant_header", (
+            f"Expected message_code 'missing_tenant_header' for no-tenant GET, got: {response.text}"
+        )
+    except requests.exceptions.JSONDecodeError:
+        body_str = response.text.lower()
+        assert any(kw in body_str for kw in ("tenant", "missing tenant header", "x-tenant", "malformed")), (
+            f"Expected tenant-header-related error in response body for no-tenant GET, got: {response.text}"
+        )
 
 
 def submit_evalhub_job(
@@ -285,10 +357,9 @@ def validate_evalhub_post_denied(
         f"Expected 400 or 403 for cross-tenant POST, got {response.status_code}: {response.text}"
     )
     try:
-        body = response.json()
+        body_str = str(response.json()).lower()
     except ValueError:
-        body = {}
-    body_str = str(body).lower()
+        body_str = response.text.lower()
     assert any(kw in body_str for kw in ("unauthorized", "forbidden", "auth")), (
         f"Expected auth-related error in response body for cross-tenant POST, got: {response.text}"
     )
@@ -325,13 +396,14 @@ def validate_evalhub_post_no_tenant(
     )
     assert response.status_code == 400, f"Expected 400 Bad Request, got {response.status_code}: {response.text}"
     try:
-        body = response.json()
-    except ValueError:
-        body = {}
-    body_str = str(body).lower()
-    assert any(kw in body_str for kw in ("tenant", "missing tenant header", "x-tenant")), (
-        f"Expected tenant-header-related error in response body for no-tenant POST, got: {response.text}"
-    )
+        assert response.json().get("message_code") == "missing_tenant_header", (
+            f"Expected message_code 'missing_tenant_header' for no-tenant POST, got: {response.text}"
+        )
+    except requests.exceptions.JSONDecodeError:
+        body_str = response.text.lower()
+        assert any(kw in body_str for kw in ("tenant", "missing tenant header", "x-tenant", "malformed")), (
+            f"Expected tenant-header-related error in response body for no-tenant POST, got: {response.text}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +483,7 @@ def wait_for_evalhub_job(
         state = sample.get("status", {}).get("state", "")
         LOGGER.info(f"Job {job_id} state: {state}")
         if state in EVALHUB_JOB_TERMINAL_STATES:
+            LOGGER.debug(f"Job {job_id} final result: {sample}")
             return sample
 
     raise TimeoutExpiredError(f"Job '{job_id}' did not reach a terminal state within {timeout}s")
@@ -536,10 +609,9 @@ def validate_evalhub_delete_denied(
         f"Expected 400 or 403 for cross-tenant DELETE, got {response.status_code}: {response.text}"
     )
     try:
-        body = response.json()
+        body_str = str(response.json()).lower()
     except ValueError:
-        body = {}
-    body_str = str(body).lower()
+        body_str = response.text.lower()
     assert any(kw in body_str for kw in ("unauthorized", "forbidden", "auth")), (
         f"Expected auth-related error in response body for cross-tenant DELETE, got: {response.text}"
     )
@@ -561,13 +633,14 @@ def validate_evalhub_delete_no_tenant(
     )
     assert response.status_code == 400, f"Expected 400 Bad Request, got {response.status_code}: {response.text}"
     try:
-        body = response.json()
-    except ValueError:
-        body = {}
-    body_str = str(body).lower()
-    assert any(kw in body_str for kw in ("tenant", "missing tenant header", "x-tenant")), (
-        f"Expected tenant-header-related error in response body for no-tenant DELETE, got: {response.text}"
-    )
+        assert response.json().get("message_code") == "missing_tenant_header", (
+            f"Expected message_code 'missing_tenant_header' for no-tenant DELETE, got: {response.text}"
+        )
+    except requests.exceptions.JSONDecodeError:
+        body_str = response.text.lower()
+        assert any(kw in body_str for kw in ("tenant", "missing tenant header", "x-tenant", "malformed")), (
+            f"Expected tenant-header-related error in response body for no-tenant DELETE, got: {response.text}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +681,55 @@ def get_evalhub_job_http(
         verify=ca_bundle_file,
         timeout=10,
     )
+
+
+def evalhub_job_logs_path(job_id: str, *, benchmark_index: int | None = None) -> str:
+    """Build the logs API path for a job or a single benchmark."""
+    if benchmark_index is None:
+        return EVALHUB_JOB_LOGS_PATH_TEMPLATE.format(job_id=job_id)
+    return EVALHUB_JOB_BENCHMARK_LOGS_PATH_TEMPLATE.format(
+        job_id=job_id,
+        benchmark_index=benchmark_index,
+    )
+
+
+def get_evalhub_job_logs_http(
+    host: str,
+    token: str,
+    ca_bundle_file: str,
+    tenant: str,
+    job_id: str,
+    benchmark_index: int | None = None,
+    params: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+) -> requests.Response:
+    """GET evaluation job or benchmark logs without asserting status."""
+    path = evalhub_job_logs_path(job_id=job_id, benchmark_index=benchmark_index)
+    url = f"https://{host}{path}"
+    request_headers = headers if headers is not None else build_headers(token=token, tenant=tenant)
+    return requests.get(
+        url=url,
+        headers=request_headers,
+        params=params,
+        verify=ca_bundle_file,
+        timeout=30,
+    )
+
+
+def build_failing_evalhub_job_payload(
+    tenant_namespace: str,
+    job_name: str = "evalhub-failing-job",
+) -> dict:
+    """Build a job payload that targets an unreachable in-cluster model endpoint."""
+    model_url = f"http://nonexistent-model.{tenant_namespace}.svc.cluster.local:{EVALHUB_VLLM_EMULATOR_PORT}/v1"
+    return {
+        "name": job_name,
+        "model": {
+            "url": model_url,
+            "name": "emulatedModel",
+        },
+        "benchmarks": [build_vllm_arc_easy_benchmark(num_examples=3)],
+    }
 
 
 def evalhub_runtime_label_selector(evalhub_job_id: str) -> str:
@@ -947,7 +1069,9 @@ def _get_evalhub_job_workload(
     """Get the Kueue Workload for an EvalHub job.
 
     EvalHub creates batch Jobs with labels app=evalhub, component=evaluation-job, job_id={id}.
-    Kueue creates a Workload for each Job with matching owner reference.
+    Kueue creates a Workload for each Job labelled with kueue.x-k8s.io/job-uid={job.uid}.
+    Kueue Workloads do NOT inherit the Job's labels, so we must look up the Job first
+    to get its UID, then find the Workload by that UID.
 
     Args:
         admin_client: Kubernetes client with admin privileges.
@@ -958,11 +1082,27 @@ def _get_evalhub_job_workload(
         Workload instance or None if not found.
     """
     selector = evalhub_runtime_label_selector(evalhub_job_id=evalhub_job_id)
+    jobs = list(Job.get(client=admin_client, namespace=namespace, label_selector=selector))
+    if not jobs:
+        return None
+
+    if len(jobs) > 1:
+        LOGGER.warning(
+            "Multiple Kubernetes Jobs matched one EvalHub job — using the first. "
+            "This can happen with multi-benchmark payloads.",
+            evalhub_job_id=evalhub_job_id,
+            job_names=[job.name for job in jobs],
+        )
+
+    job_uid = jobs[0].instance.metadata.uid
+    if not job_uid:
+        return None
+
     workloads = list(
         Workload.get(
             client=admin_client,
             namespace=namespace,
-            label_selector=selector,
+            label_selector=f"kueue.x-k8s.io/job-uid={job_uid}",
         )
     )
     return workloads[0] if workloads else None

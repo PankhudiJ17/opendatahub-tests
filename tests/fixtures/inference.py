@@ -9,16 +9,19 @@ from ocp_resources.data_science_cluster import DataScienceCluster
 from ocp_resources.deployment import Deployment
 from ocp_resources.inference_service import InferenceService
 from ocp_resources.namespace import Namespace
+from ocp_resources.pod import Pod
 from ocp_resources.resource import ResourceEditor
+from ocp_resources.secret import Secret
+from ocp_resources.service import Service
 from ocp_resources.serving_runtime import ServingRuntime
 from pytest_testconfig import py_config
 from timeout_sampler import retry
 
 from utilities.constants import (
+    QWEN_MODEL_NAME,
     KServeDeploymentType,
     LLMdInferenceSimConfig,
     RuntimeTemplates,
-    Timeout,
     VLLMGPUConfig,
 )
 from utilities.inference_utils import create_isvc
@@ -90,7 +93,14 @@ def llm_d_inference_sim_serving_runtime(
                     "image": "quay.io/trustyai_testing/llm-d-inference-sim-dataset-builtin"
                     "@sha256:79e525cfd57a0d72b7e71d5f1e2dd398eca9315cfbd061d9d3e535b1ae736239",
                     "imagePullPolicy": "Always",
-                    "args": ["--model", LLMdInferenceSimConfig.model_name, "--port", str(LLMdInferenceSimConfig.port)],
+                    "args": [
+                        "--model",
+                        LLMdInferenceSimConfig.model_name,
+                        "--port",
+                        str(LLMdInferenceSimConfig.port),
+                        "--max-model-len",
+                        str(LLMdInferenceSimConfig.max_model_len),
+                    ],
                     "ports": [{"containerPort": LLMdInferenceSimConfig.port, "protocol": "TCP"}],
                     "securityContext": {
                         "allowPrivilegeEscalation": False,
@@ -155,7 +165,7 @@ def llm_d_inference_sim_isvc(
                 name=f"{isvc.name}-predictor",
                 namespace=model_namespace.name,
             )
-            deployment.wait_for_replicas(timeout=Timeout.TIMEOUT_2MIN)
+            deployment.wait_for_replicas(timeout=120)
             yield isvc
 
 
@@ -286,31 +296,102 @@ def get_vllm_chat_config(namespace: str) -> dict[str, Any]:
     }
 
 
-@pytest.fixture(scope="class")
-def patched_dsc_garak_kfp(admin_client) -> Generator[DataScienceCluster]:
-    """Configure the DataScienceCluster for Garak and KFP (Kubeflow Pipelines) testing.
-
-    This fixture patches the DataScienceCluster to enable:
-        - KServe in Headed mode (using Service port instead of Pod port)
-        - AI Pipelines component in Managed state
-        - MLflow operator in Managed state
-
-    Waits for the DSC to be ready before yielding.
-    """
-
+def _patched_dsc_garak(admin_client: DynamicClient, components: dict) -> Generator[DataScienceCluster]:
     dsc = get_data_science_cluster(client=admin_client)
-    with ResourceEditor(
-        patches={
-            dsc: {
-                "spec": {
-                    "components": {
-                        "kserve": {"rawDeploymentServiceConfig": "Headed"},
-                        "aipipelines": {"managementState": "Managed"},
-                        "mlflowoperator": {"managementState": "Managed"},
-                    }
-                }
-            }
-        }
-    ):
+    with ResourceEditor(patches={dsc: {"spec": {"components": components}}}):
         wait_for_dsc_status_ready(dsc_resource=dsc)
         yield dsc
+
+
+@pytest.fixture(scope="class")
+def patched_dsc_garak(admin_client: DynamicClient) -> Generator[DataScienceCluster]:
+    """Configure DSC for Garak simple mode: KServe Headed + MLflow."""
+    yield from _patched_dsc_garak(
+        admin_client=admin_client,
+        components={
+            "kserve": {"rawDeploymentServiceConfig": "Headed"},
+            "mlflowoperator": {"managementState": "Managed"},
+        },
+    )
+
+
+@pytest.fixture(scope="class")
+def patched_dsc_garak_kfp(admin_client: DynamicClient) -> Generator[DataScienceCluster]:
+    """Configure DSC for Garak KFP mode: KServe Headed + MLflow + AI Pipelines."""
+    yield from _patched_dsc_garak(
+        admin_client=admin_client,
+        components={
+            "kserve": {"rawDeploymentServiceConfig": "Headed"},
+            "aipipelines": {"managementState": "Managed"},
+            "mlflowoperator": {"managementState": "Managed"},
+        },
+    )
+
+
+@pytest.fixture(scope="class")
+def qwen_isvc(
+    admin_client: DynamicClient,
+    model_namespace: Namespace,
+    minio_pod: Pod,
+    minio_service: Service,
+    minio_data_connection: Secret,
+    vllm_cpu_runtime: ServingRuntime,
+    pytestconfig: pytest.Config,
+    teardown_resources: bool,
+) -> Generator[InferenceService, Any, Any]:
+    if pytestconfig.option.post_upgrade:
+        isvc = InferenceService(
+            client=admin_client,
+            name=QWEN_MODEL_NAME,
+            namespace=model_namespace.name,
+        )
+        yield isvc
+        isvc.clean_up()
+    else:
+        # During pre-upgrade or normal tests, create new InferenceService
+        with create_isvc(
+            client=admin_client,
+            name=QWEN_MODEL_NAME,
+            namespace=model_namespace.name,
+            deployment_mode=KServeDeploymentType.RAW_DEPLOYMENT,
+            model_format="vLLM",
+            runtime=vllm_cpu_runtime.name,
+            storage_key=minio_data_connection.name,
+            storage_path="Qwen2.5-0.5B-Instruct",
+            wait_for_predictor_pods=False,
+            enable_auth=False,
+            resources={
+                "requests": {"cpu": "2", "memory": "10Gi"},
+                "limits": {"cpu": "2", "memory": "12Gi"},
+            },
+            teardown=teardown_resources,
+        ) as isvc:
+            yield isvc
+
+
+@pytest.fixture(scope="class")
+def vllm_cpu_runtime(
+    admin_client: DynamicClient,
+    model_namespace: Namespace,
+    minio_pod: Pod,
+    minio_service: Service,
+    minio_data_connection: Secret,
+) -> Generator[ServingRuntime, Any, Any]:
+    with ServingRuntimeFromTemplate(
+        client=admin_client,
+        name="vllm-runtime-cpu-fp16",
+        namespace=model_namespace.name,
+        template_name=RuntimeTemplates.VLLM_CUDA,
+        deployment_type=KServeDeploymentType.RAW_DEPLOYMENT,
+        runtime_image="quay.io/rh-aiservices-bu/vllm-cpu-openai-ubi9"
+        "@sha256:ada6b3ba98829eb81ae4f89364d9b431c0222671eafb9a04aa16f31628536af2",
+        containers={
+            "kserve-container": {
+                "args": ["--port=8032", "--model=/mnt/models", "--served-model-name={{.Name}}"],
+                "ports": [{"containerPort": 8032, "protocol": "TCP"}],
+                "volumeMounts": [{"mountPath": "/dev/shm", "name": "shm"}],
+            }
+        },
+        volumes=[{"emptyDir": {"medium": "Memory", "sizeLimit": "2Gi"}, "name": "shm"}],
+    ) as serving_runtime:
+        yield serving_runtime
