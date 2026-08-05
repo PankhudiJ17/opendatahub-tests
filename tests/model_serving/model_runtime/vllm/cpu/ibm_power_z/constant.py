@@ -1,5 +1,6 @@
 from typing import Any
 
+GRANITE_4_1_8B_MODEL_PATH: str = "models/granite-4.1-8b"
 FALCON3_7B_INSTRUCT_MODEL_PATH: str = "models/Falcon3-7B-Instruct"
 LLAMA_3_2_1B_INSTRUCT_MODEL_PATH: str = "models/llama-32-1b-instruct"
 PHI_4_MODEL_PATH: str = "models/phi-4"
